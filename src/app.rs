@@ -2019,6 +2019,7 @@ impl App {
                 Event::UpdateSupport(result) => {
                     if result.is_ok()
                         && self.settings.download_updates_automatically
+                        && !self.metered()
                         && matches!(self.update_download, crate::updates::DownloadState::Idle)
                     {
                         self.actions.push(Action::DownloadUpdate);
@@ -2054,6 +2055,7 @@ impl App {
                             }
                             self.update = Some(notice);
                             if self.settings.download_updates_automatically
+                                && !self.metered()
                                 && matches!(
                                     self.update_download,
                                     crate::updates::DownloadState::Idle
@@ -2824,8 +2826,11 @@ impl App {
             .retain(|toast| toast.created.elapsed() < TOAST_LIFETIME);
         self.maybe_suggest_personal_app();
 
+        // Not on a metered connection: the check waits for one that is not,
+        // and checking by hand still works.
         if self.settings.check_for_updates
             && !self.offline
+            && !self.metered()
             && self
                 .last_update_check
                 .is_none_or(|at| at.elapsed() >= crate::updates::CHECK_INTERVAL)
@@ -3499,8 +3504,12 @@ impl App {
                 self.media_art = Some((url.to_owned(), file.clone()));
                 Some(file)
             }
+            // On a metered connection the controls go without the large
+            // cover rather than download one for every song.
             None => {
-                self.backend.art().prefetch(ctx, url);
+                if !self.metered() {
+                    self.backend.art().prefetch(ctx, url);
+                }
                 None
             }
         }
@@ -9843,6 +9852,12 @@ impl App {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         self.note_close_request(close_requested, self.hides_to_tray());
         self.schedule_next_pass(ctx);
+    }
+
+    /// Whether the system reports the connection as metered or charged by
+    /// use, so automatic downloads wait.
+    fn metered(&self) -> bool {
+        self.power.conditions().metered
     }
 
     /// Follows the system's power and session state: works out the budget
@@ -17233,6 +17248,40 @@ mod tests {
         assert_eq!(app.media_art, None, "a path into a deleted cache");
 
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// On a metered connection the media controls go without the large
+    /// cover rather than download one for every song.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_metered_connection_downloads_no_cover_for_the_controls() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        let url = "https://i.scdn.co/image/metered";
+        app.power.set(|conditions| conditions.metered = true);
+        assert_eq!(app.media_art_file(&ctx, url), None);
+        assert!(
+            app.backend.art().prefetch(&ctx, url),
+            "nothing should have asked for it before"
+        );
+    }
+
+    /// The daily update check waits for a connection that is not metered.
+    #[test]
+    fn a_metered_connection_puts_off_the_update_check() {
+        let mut app = headless_app();
+        app.settings.check_for_updates = true;
+        app.last_update_check = None;
+        app.power.set(|conditions| conditions.metered = true);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.background_frame(ui.ctx());
+        });
+        output.textures_delta.clear();
+        assert!(
+            app.last_update_check.is_none(),
+            "checked on a metered network"
+        );
     }
 
     /// MPRIS hands the desktop the artwork URL and reads no file, so the
