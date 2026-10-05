@@ -9740,6 +9740,8 @@ impl App {
         if budget != self.budget {
             log::debug!("budget: {budget:?}");
             self.budget = budget;
+            self.power
+                .set_background(budget == crate::power::Budget::Background);
         }
         for event in self.power.take_events() {
             use crate::power::Event;
