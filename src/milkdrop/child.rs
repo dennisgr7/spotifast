@@ -209,6 +209,9 @@ struct Child {
     last_click: Option<Instant>,
     next_frame: Instant,
     reported: Option<([f32; 2], [f32; 2])>,
+    /// The window is covered or, on Wayland, suspended: nothing is drawn
+    /// until it shows again.
+    occluded: bool,
 }
 
 impl Child {
@@ -239,6 +242,7 @@ impl Child {
             last_click: None,
             next_frame: Instant::now(),
             reported: None,
+            occluded: false,
         }
     }
 
@@ -470,6 +474,12 @@ impl ApplicationHandler<Control> for Child {
                 self.render();
                 self.schedule_next_frame();
             }
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded && let Some(live) = &self.live {
+                    live.window.request_redraw();
+                }
+            }
             _ => {}
         }
     }
@@ -479,6 +489,13 @@ impl ApplicationHandler<Control> for Child {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             return;
         };
+        // A window nobody can see renders nothing. Showing it again brings
+        // an event (Occluded, or a resize back from a minimised size) that
+        // asks for the next frame.
+        if self.occluded || live.window.is_minimized() == Some(true) {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            return;
+        }
         match self.frame_interval() {
             None => {
                 live.window.request_redraw();
