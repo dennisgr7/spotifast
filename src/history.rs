@@ -68,7 +68,13 @@ impl History {
         }
         match serde_json::to_string(&self.plays) {
             Ok(text) => {
-                if let Err(error) = std::fs::write(path, text) {
+                // Through a temporary file, as settings are: the history is
+                // written when the session ends, and a shutdown that cuts the
+                // write short must not leave half a file behind.
+                let temporary = path.with_extension("json.tmp");
+                let written = std::fs::write(&temporary, text)
+                    .and_then(|()| crate::util::replace_file(&temporary, path));
+                if let Err(error) = written {
                     log::warn!("could not write the play history: {error}");
                 }
             }
@@ -312,5 +318,35 @@ mod tests {
             format!("spotify:track:{}", KEPT + 9),
             "the newest is first"
         );
+    }
+
+    /// A save replaces the whole file and leaves no temporary behind, and a
+    /// second save over it reads back the newer history.
+    #[test]
+    fn a_saved_history_reads_back_whole() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-history-{:016x}", rand::random::<u64>()));
+        let path = dir.join("history.json");
+        let at: jiff::Timestamp = "2026-09-01T09:00:00Z".parse().unwrap();
+        let mut history = History::default();
+        for uri in ["spotify:track:a", "spotify:track:b"] {
+            history.record(
+                Track {
+                    uri: uri.into(),
+                    ..Track::default()
+                },
+                at,
+            );
+            history.save(&path);
+        }
+        let read = History::load(&path);
+        let uris: Vec<_> = read
+            .plays()
+            .iter()
+            .map(|play| play.track.uri.as_str())
+            .collect();
+        assert_eq!(uris, ["spotify:track:b", "spotify:track:a"]);
+        assert!(!path.with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
