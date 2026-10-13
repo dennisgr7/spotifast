@@ -3254,24 +3254,7 @@ impl Worker {
     /// The system is about to sleep: music playing here pauses at once, by
     /// what the engine is doing rather than by what the app shows.
     fn pause_for_sleep(&mut self) {
-        // A pickup still on its way to a session, a reconnect queued or one
-        // waiting for the network, wakes paused too rather than starting
-        // the music when the lid opens.
-        if self.resume.is_some() || self.resume_verify.is_some() {
-            self.pickup_paused = true;
-            let pending = self
-                .resume
-                .iter_mut()
-                .chain(self.resume_verify.iter_mut().map(|(pending, _)| pending));
-            for pending in pending {
-                if let PlaybackResume::Track(load) = pending {
-                    load.play = false;
-                }
-            }
-            if let Some(alone) = &mut self.resume_alone {
-                alone.play = false;
-            }
-        }
+        self.keep_pickup_paused();
         let Some(engine) = &self.engine else {
             return;
         };
@@ -3281,6 +3264,28 @@ impl Worker {
             && let Err(error) = engine.command(PlayerCommand::Pause)
         {
             log::warn!("unable to pause for sleep: {error}");
+        }
+    }
+
+    /// A pickup still on its way to a session, a reconnect queued or one
+    /// waiting for the network, wakes paused rather than starting the music
+    /// when the lid opens: the music it stands for was paused for the sleep.
+    fn keep_pickup_paused(&mut self) {
+        if self.resume.is_none() && self.resume_verify.is_none() {
+            return;
+        }
+        self.pickup_paused = true;
+        let pending = self
+            .resume
+            .iter_mut()
+            .chain(self.resume_verify.iter_mut().map(|(pending, _)| pending));
+        for pending in pending {
+            if let PlaybackResume::Track(load) = pending {
+                load.play = false;
+            }
+        }
+        if let Some(alone) = &mut self.resume_alone {
+            alone.play = false;
         }
     }
 
@@ -3303,7 +3308,15 @@ impl Worker {
     /// until it does. A failed attempt waits for the network and tries
     /// again.
     fn on_system_resumed(&mut self, asleep: Option<Duration>, resume: Option<Pickup>) {
-        if !self.signed_in || asleep.is_some_and(|asleep| asleep < SESSION_SURVIVES_SLEEP) {
+        if !self.signed_in {
+            return;
+        }
+        // The notice before sleep marks a waiting pickup paused, but the
+        // system can sleep before it is sent. A dropped session's own
+        // snapshot, queue and all, is kept rather than swapped for the
+        // app's pickup, and wakes paused like the rest.
+        self.keep_pickup_paused();
+        if asleep.is_some_and(|asleep| asleep < SESSION_SURVIVES_SLEEP) {
             return;
         }
         if self.engine.is_some() {
@@ -6967,6 +6980,66 @@ mod authorization_tests {
             Some(PlaybackResume::Track(resume)) => {
                 assert!(!resume.play, "the pickup plays on waking");
                 assert_eq!(resume.offset_uri.as_deref(), Some("spotify:track:shown"));
+            }
+            other => panic!("expected the pickup kept, got {other:?}"),
+        }
+        assert!(
+            worker
+                .resume_alone
+                .as_ref()
+                .is_some_and(|alone| !alone.play)
+        );
+        assert!(worker.pickup_paused, "a session's snapshot is paused too");
+    }
+
+    /// The system can sleep before the notice that pauses a waiting pickup
+    /// is sent. A dropped session waiting for its next try then wakes paused
+    /// all the same, with its own pickup rather than the app's.
+    #[test]
+    fn waking_without_a_sleep_notice_keeps_a_waiting_pickup_paused() {
+        let (runtime, mut worker, _) = worker("wake-without-notice");
+        worker.signed_in = true;
+        // Waiting out the wait before its next try, with no engine.
+        worker.engine_retry = Some(1);
+        worker.resume = Some(PlaybackResume::Track(LoadSpec {
+            context_uri: Some("spotify:album:a".into()),
+            offset_uri: Some("spotify:track:shown".into()),
+            play: true,
+            ..LoadSpec::default()
+        }));
+        worker.resume_alone = Some(LoadSpec {
+            context_uri: Some("spotify:track:shown".into()),
+            play: true,
+            ..LoadSpec::default()
+        });
+        let from_the_app = Pickup {
+            load: LoadSpec {
+                context_uri: Some("spotify:track:shown".into()),
+                ..LoadSpec::default()
+            },
+            alone: None,
+        };
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands
+            .send(Command::SystemResumed {
+                asleep: Some(Duration::from_secs(120)),
+                resume: Some(from_the_app),
+            })
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), worker.run(receiver))
+                .await
+                .unwrap();
+        });
+        match &worker.resume {
+            Some(PlaybackResume::Track(resume)) => {
+                assert!(!resume.play, "the pickup plays on waking");
+                assert_eq!(
+                    resume.context_uri.as_deref(),
+                    Some("spotify:album:a"),
+                    "the session's own pickup is kept"
+                );
             }
             other => panic!("expected the pickup kept, got {other:?}"),
         }
