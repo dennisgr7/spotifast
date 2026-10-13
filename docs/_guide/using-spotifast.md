@@ -482,7 +482,9 @@ wave as a glowing line. With **Colour from album art** on, both sweep from
 bass to treble across up to four colours read from the cover, its hues first
 and its greys after, so a black and white cover moves in grey; with it off,
 they take the accent colour. It follows the equalizer, not the volume, and moves only while the
-song plays on this computer. It is off by default. Clicking the player
+song plays on this computer. The wave grows from its midline when the sound
+starts, not while the song loads, and settles back onto it when the song
+stops. It is off by default. Clicking the player
 bar's empty space switches it, as Winamp's visualizer did: off, then
 Spectrum, then Waveform, then off again. **Frame rate** in **Settings >
 Appearance** sets how often it and the mini player's analyser draw: 30, 60
@@ -498,8 +500,9 @@ visualizer** in **Settings > Appearance** to prevent accidental changes.
 Spotifast follows the system when it asks for less motion: **Animation
 effects** turned off in Windows, **Reduce motion** on macOS, or GNOME's
 **Animations** turned off. Its animations then show where they end at once:
-the player bar's colour changes without fading, lyrics jump to the sung line,
-and a new theme replaces the old one without the reveal. Spinners still turn.
+the player bar's colour changes without fading, the wave appears and goes
+without growing or settling, lyrics jump to the sung line, and a new theme
+replaces the old one without the reveal. Spinners still turn.
 
 In **Settings > Appearance**, **Compact track list** puts each song on one
 line. In narrow lists, the added date follows the artist credits with a spaced
