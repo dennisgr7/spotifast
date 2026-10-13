@@ -614,11 +614,14 @@ pub struct App {
     saved_recordings: HashSet<String>,
     /// Optimistic library writes that a stale contains response must not undo.
     saved_writes: HashMap<String, bool>,
-    pub accents: HashMap<String, Color32>,
+    /// Each cover's colour as read, before the theme makes a tint of it, so
+    /// a change of theme keeps it.
+    pub accents: HashMap<String, [u8; 3]>,
     /// Each cover's colours, as read from the art, by the same URL.
     art_palettes: HashMap<String, Vec<[u8; 3]>>,
     accent_pending: HashSet<String>,
-    /// Covers that gave no colour, so nothing reads them again.
+    /// Covers that gave no colour, so pages showing them stop waiting and
+    /// nothing reads them again.
     accent_missing: HashSet<String>,
     /// Covers that could not be read, for now or for good.
     accent_failed: HashMap<String, AccentFailure>,
@@ -2461,7 +2464,29 @@ impl App {
         }
         let now = self.now_playing()?;
         let url = now.art_small.or(now.art_url)?;
-        self.accents.get(&url).copied()
+        let color = self.accents.get(&url)?;
+        Some(self.palette.tint_from_art(*color))
+    }
+
+    /// The playing song's colour, asked for when it is not known yet. While
+    /// it is read, after a change of song the player has not confirmed yet
+    /// too, it is pending, so what shows the last song's colour holds it.
+    pub(crate) fn song_tint(&mut self) -> crate::ui::PageTint {
+        use crate::ui::PageTint;
+        if !self.settings.accent_from_art {
+            return PageTint::None;
+        }
+        let Some(url) = self
+            .now_playing()
+            .and_then(|now| now.art_small.or(now.art_url))
+        else {
+            return PageTint::None;
+        };
+        match self.tint_for(Some(&url)) {
+            Some(color) => PageTint::Color(color),
+            None if self.tint_missing(&url) => PageTint::None,
+            None => PageTint::Pending,
+        }
     }
 
     /// The playing art's colours, the accent first, for the visualizer.
@@ -2477,7 +2502,7 @@ impl App {
     pub fn tint_for(&mut self, url: Option<&str>) -> Option<Color32> {
         let url = url?;
         if let Some(color) = self.accents.get(url) {
-            return Some(*color);
+            return Some(self.palette.tint_from_art(*color));
         }
         // Pages ask every frame: a cover found to have no colour is not read
         // again, and one that could not be read waits before the next try,
@@ -2505,6 +2530,12 @@ impl App {
             .filter(|failed| failed.failures < ACCENT_READS && failed.retry_at > now)
             .map(|failed| failed.retry_at - now)
             .min()
+    }
+
+    /// Whether `url`'s cover gave no colour, or could not be read: what
+    /// shows it does without, rather than wait on a read that may not come.
+    pub fn tint_missing(&self, url: &str) -> bool {
+        self.accent_missing.contains(url) || self.accent_failed.contains_key(url)
     }
 
     /// Finds a playlist already loaded in the library, search, or a Home shelf.
@@ -2830,9 +2861,8 @@ impl App {
                         Ok(palette) => {
                             self.accent_failed.remove(&url);
                             if let Some(&color) = palette.first() {
-                                let tint = self.palette.tint_from_art(color);
                                 self.art_palettes.insert(url.clone(), palette);
-                                self.accents.insert(url, tint);
+                                self.accents.insert(url, color);
                             } else {
                                 self.accent_missing.insert(url);
                             }
@@ -4864,10 +4894,6 @@ impl App {
             theme::apply(ctx, &self.palette);
             crate::motion::apply(ctx, self.motion.reduced());
             self.applied_dark = Some(dark);
-            self.accents.clear();
-            self.accent_pending.clear();
-            self.accent_missing.clear();
-            self.accent_failed.clear();
         }
     }
 
@@ -22430,11 +22456,12 @@ mod tests {
         }]);
         assert_eq!(app.tint_for(Some(url)), None);
         assert!(!app.accent_pending.contains(url), "later frames do not");
+        assert!(app.tint_missing(url));
     }
 
-    /// A cover that could not be read, its bytes not decoding say, is asked
-    /// for again after a pause, a few times at most, and once more when the
-    /// network comes back.
+    /// A cover that could not be read goes without a colour meanwhile, so
+    /// nothing holds on to the last one, and is asked for again after a
+    /// pause, a few times at most.
     #[test]
     fn a_cover_that_could_not_be_read_is_asked_for_again_a_few_times() {
         let mut app = test_app("accent-retry");
@@ -22446,8 +22473,9 @@ mod tests {
                 reads += 1;
                 app.handle_backend_events(vec![Event::Accent {
                     url: url.into(),
-                    palette: Err("the cover's bytes do not decode".into()),
+                    palette: Err("offline".into()),
                 }]);
+                assert!(app.tint_missing(url), "it does without meanwhile");
                 app.tint_for(Some(url));
                 assert!(!app.accent_pending.contains(url), "not at once");
                 if reads < ACCENT_READS {
@@ -22466,6 +22494,77 @@ mod tests {
         app.on_network_restored();
         app.tint_for(Some(url));
         assert!(app.accent_pending.contains(url), "the network came back");
+    }
+
+    /// A cover's colour is kept as read, so a new theme makes its own tint
+    /// of it rather than reading every cover again.
+    #[test]
+    fn a_cover_colour_outlives_a_change_of_theme() {
+        let mut app = test_app("accent-theme");
+        let ctx = egui::Context::default();
+        let url = "http://127.0.0.1:9/red";
+        let red = [200, 40, 40];
+        app.tint_for(Some(url));
+        app.handle_backend_events(vec![Event::Accent {
+            url: url.into(),
+            palette: Ok(vec![red]),
+        }]);
+        for (choice, palette) in [
+            (ThemeChoice::Dark, Palette::dark()),
+            (ThemeChoice::Light, Palette::light()),
+        ] {
+            app.apply(Action::SetTheme(choice), &ctx);
+            app.apply_theme(&ctx);
+            assert_eq!(app.tint_for(Some(url)), Some(palette.tint_from_art(red)));
+        }
+        assert!(app.accent_pending.is_empty(), "nothing is read again");
+    }
+
+    /// A song shown before the player confirms it brings its colour like
+    /// any other: asked for at once, and pending, not missing, meanwhile.
+    #[test]
+    fn a_new_songs_colour_is_pending_until_it_is_read() {
+        use crate::ui::PageTint;
+        let mut app = test_app("song-tint");
+        let url = "http://127.0.0.1:9/next";
+        let playing = NowPlaying {
+            local: true,
+            device_name: None,
+            device_kind: None,
+            uri: "spotify:track:next".into(),
+            id: None,
+            title: String::new(),
+            artists: Vec::new(),
+            subtitle: String::new(),
+            album_name: String::new(),
+            album_id: None,
+            show_id: None,
+            art_url: None,
+            art_small: Some(url.into()),
+            duration_ms: 200_000,
+            position_ms: 0,
+            playing: true,
+            loading: true,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            volume_percent: 50,
+            can_control: true,
+            can_set_volume: true,
+            is_episode: false,
+            resuming: false,
+        };
+        app.frame_now = Some(playing.clone());
+        assert_eq!(app.song_tint(), PageTint::Pending);
+        assert!(app.accent_pending.contains(url), "its colour is asked for");
+        app.handle_backend_events(vec![Event::Accent {
+            url: url.into(),
+            palette: Ok(vec![[30, 90, 200]]),
+        }]);
+        app.frame_now = Some(playing);
+        assert_eq!(
+            app.song_tint(),
+            PageTint::Color(app.palette.tint_from_art([30, 90, 200]))
+        );
     }
 
     /// Two lookups of one adder can overlap; the one that found nothing

@@ -44,12 +44,56 @@ const SPECTRUM_GAP: f32 = 2.0;
 
 /// Forget this bar's animation session while the sign-in screen is shown.
 pub(crate) fn end_tint_session(ctx: &egui::Context) {
-    ctx.data_mut(|data| data.remove::<u64>(egui::Id::new(TINT_SESSION_ID)));
+    ctx.data_mut(|data| {
+        data.remove::<u64>(egui::Id::new(TINT_SESSION_ID));
+        data.remove::<Option<Color32>>(egui::Id::new(HELD_TINT_ID));
+        data.remove::<Option<Vec<[u8; 3]>>>(egui::Id::new(HELD_PALETTE_ID));
+    });
+}
+
+const HELD_TINT_ID: &str = "player-bar-held-tint";
+const HELD_PALETTE_ID: &str = "player-bar-held-palette";
+
+/// The playing song's tint for the bar and its visualizer. While a new
+/// song's colour is still being read the last one stays, so neither fades
+/// to plain colours and back on the way to it.
+fn held_tint(ctx: &egui::Context, tint: super::PageTint) -> Option<Color32> {
+    let id = egui::Id::new(HELD_TINT_ID);
+    let tint = match tint {
+        super::PageTint::Color(color) => Some(color),
+        super::PageTint::None => None,
+        super::PageTint::Pending => ctx
+            .data(|data| data.get_temp::<Option<Color32>>(id))
+            .flatten(),
+    };
+    ctx.data_mut(|data| data.insert_temp(id, tint));
+    tint
+}
+
+/// The playing song's colours for the visualizer, held like its tint while
+/// a new song's are still being read.
+fn held_palette(
+    ctx: &egui::Context,
+    tint: super::PageTint,
+    palette: Option<&[[u8; 3]]>,
+) -> Option<Vec<[u8; 3]>> {
+    let id = egui::Id::new(HELD_PALETTE_ID);
+    let palette = match tint {
+        super::PageTint::Pending => ctx
+            .data(|data| data.get_temp::<Option<Vec<[u8; 3]>>>(id))
+            .flatten(),
+        _ => palette.map(<[_]>::to_vec),
+    };
+    ctx.data_mut(|data| data.insert_temp(id, palette.clone()));
+    palette
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    let fill = eased_fill(ui.ctx(), palette.panel, app.now_playing_tint());
+    let song = app.song_tint();
+    let tint = held_tint(ui.ctx(), song);
+    let art = held_palette(ui.ctx(), song, app.now_playing_palette());
+    let fill = eased_fill(ui.ctx(), palette.panel, tint);
     egui::Panel::bottom("player-bar")
         .exact_size(theme::PLAYER_BAR_HEIGHT)
         .resizable(false)
@@ -64,7 +108,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             let now = app.now_playing();
             // The whole bar, margins included, behind everything else.
             let behind = rect.expand2(vec2(16.0, 0.0));
-            if visualizer(app, ui, behind, now.as_ref()) {
+            if visualizer(app, ui, behind, now.as_ref(), art.as_deref()) {
                 theme::visualiser_frame(ui.ctx(), app.visualiser_fps());
             }
             // Its empty space is the visualizer's control, as Winamp's
@@ -128,13 +172,19 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 /// computer across `rect`, in colours drawn from the cover. It reads the
 /// same post-equalizer, pre-volume sound as the mini player's visualizer,
 /// so the volume never moves it. Returns whether it is still moving.
-fn visualizer(app: &mut App, ui: &egui::Ui, rect: Rect, now: Option<&NowPlaying>) -> bool {
+fn visualizer(
+    app: &mut App,
+    ui: &egui::Ui,
+    rect: Rect,
+    now: Option<&NowPlaying>,
+    art: Option<&[[u8; 3]]>,
+) -> bool {
     use crate::settings::PlayerBarVis;
     use crate::vis;
     let mode = app.settings.player_bar_vis;
     let sounding = app.visualizer_sounding(now);
     let dark = ui.visuals().dark_mode;
-    let colours = vis_colours(app.now_playing_palette(), app.palette.accent, dark);
+    let colours = vis_colours(art, app.palette.accent, dark);
     // Over a light bar the same colour paints more strongly, or white
     // would wash it out.
     let strength = if dark { 1.0 } else { LIGHT_STRENGTH };
@@ -1222,6 +1272,31 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, transport_
 mod player_bar_tint_tests {
     use super::*;
     use crate::theme::Palette;
+
+    /// A new song's colour still being read keeps the last song's, and a
+    /// song without one lets it go.
+    #[test]
+    fn the_bar_holds_its_tint_while_a_new_songs_colour_is_read() {
+        let ctx = egui::Context::default();
+        let red = Color32::from_rgb(120, 30, 30);
+        assert_eq!(held_tint(&ctx, crate::ui::PageTint::Pending), None);
+        assert_eq!(held_tint(&ctx, crate::ui::PageTint::Color(red)), Some(red));
+        assert_eq!(held_tint(&ctx, crate::ui::PageTint::Pending), Some(red));
+        let palette = [[120, 30, 30], [30, 30, 120]];
+        let colour = crate::ui::PageTint::Color(red);
+        assert_eq!(
+            held_palette(&ctx, colour, Some(&palette)),
+            Some(palette.to_vec())
+        );
+        assert_eq!(
+            held_palette(&ctx, crate::ui::PageTint::Pending, None),
+            Some(palette.to_vec()),
+            "the last song's colours stay while the next one's are read"
+        );
+        assert_eq!(held_palette(&ctx, crate::ui::PageTint::None, None), None);
+        assert_eq!(held_tint(&ctx, crate::ui::PageTint::None), None);
+        assert_eq!(held_tint(&ctx, crate::ui::PageTint::Pending), None);
+    }
 
     /// The light rises over its rise time and falls over its fall time,
     /// and less motion skips straight to the end.
