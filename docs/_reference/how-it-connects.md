@@ -446,6 +446,37 @@ reconnection waits for one instead of retrying. Spotifast asks the system
 about the internet as a whole rather than about a Spotify host, so the check
 looks up no name and sends nothing over the network.
 
+A reconnection that cannot reach Spotify (a timeout, or a DNS, connection or
+network error), for example because the network is not back yet after the
+computer wakes, keeps what was playing and tries again after 2 seconds, then
+4, 8 and so on up to once a minute, and at once when macOS reports the
+network back. The same applies when the stored credential cannot connect at
+start-up. Any other failure, such as Spotify refusing the credential or an
+account without Premium, stops it and shows the error, and then **Try again**
+opens the browser; after a network failure it reconnects with the stored
+credential instead.
+
+Without internet, every track librespot tries to load fails, and it marks each
+one unavailable and skips to the next. On macOS, while the system reports no
+internet, the app says so once instead of once per track, leaves the session
+alone, and replaces it when the network is back, so the marks go with it.
+Elsewhere, three tracks failing within 20 seconds replace the session, which
+then tries again as above. A session replaced while it still runs can hand
+over only its track, so the app gives the new one the album, playlist or list
+around it as well, with the track and position shown when the last load
+failed. A track that autoplay added after its album or playlist is not part of
+it, so it comes back by itself, or, once it has played out, its radio follows.
+
+On Windows and Linux, which report sleep and waking, music playing on this
+computer pauses before it sleeps and the session is saved; the system is held
+for 1.5 seconds at most, until the player has paused, and the position stops
+there. Windows with Modern Standby may freeze the app as the display goes off;
+the pause then lands as soon as it wakes. Either way it wakes paused at the
+same spot, however long it slept, also when it was still waiting to reconnect
+as the computer slept. When it wakes after more than 90 seconds, the session
+is replaced at once, keeping what was playing, since Spotify has usually
+dropped a session that slept that long. Music on other devices is left alone.
+
 On macOS, local playback and track loading declare a user-initiated activity
 so App Nap does not throttle them when another application covers Spotifast.
 Pausing, stopping, an output error, or disconnecting releases the activity;
