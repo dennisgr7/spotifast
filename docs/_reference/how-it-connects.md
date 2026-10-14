@@ -447,14 +447,14 @@ about the internet as a whole rather than about a Spotify host, so the check
 looks up no name and sends nothing over the network.
 
 A reconnection that cannot reach Spotify (a timeout, or a DNS, connection or
-network error), for example because the network is not back yet after the
-computer wakes, keeps what was playing and tries again after 2 seconds, then
-4, 8 and so on up to once a minute, and at once when macOS reports the
-network back. The same applies when the stored credential cannot connect at
-start-up. Any other failure, such as Spotify refusing the credential or an
-account without Premium, stops it and shows the error, and then **Try again**
-opens the browser; after a network failure it reconnects with the stored
-credential instead.
+network error, as librespot reports it), for example because the network is
+not back yet after the computer wakes, keeps what was playing and tries again
+after 2 seconds, then 4, 8 and so on up to once a minute, and at once when
+macOS reports the network back. The same applies when the stored credential
+cannot connect at start-up. Any other failure, such as Spotify refusing the
+credential, an account without Premium, or a travel restriction, stops it and
+shows the error, and then **Try again** opens the browser; after a network
+failure it reconnects with the stored credential instead.
 
 Without internet, every track librespot tries to load fails, and it marks each
 one unavailable and skips to the next. On macOS, while the system reports no

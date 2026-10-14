@@ -4344,12 +4344,60 @@ impl Worker {
     }
 }
 
-/// Whether a failed engine connection can succeed on a later try: only when
-/// Spotify could not be reached in time. Anything else (a refused
-/// credential, a plan without Premium, a cache that cannot open) is shown
-/// rather than tried again in the background.
+/// Whether a failed engine connection can succeed on a later try, from the
+/// message [`friendly_connect_error`] made of it: only when Spotify could not
+/// be reached, or not in time. Anything else (a refused credential, a plan
+/// without Premium, a travel restriction, a cache that cannot open) is
+/// shown rather than tried again in the background.
 fn connect_failure_retryable(message: &str) -> bool {
     message == CONNECT_TIMED_OUT || message.starts_with(UNREACHABLE)
+}
+
+/// Whether a failed engine connection could not reach Spotify, by what
+/// librespot reported rather than by the words around it: the engine wraps
+/// every failure in "unable to connect to Spotify", which reads like the
+/// network whatever went wrong.
+fn spotify_unreachable(error: &anyhow::Error) -> bool {
+    use librespot_core::error::ErrorKind;
+    let Some(cause) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<librespot_core::Error>())
+    else {
+        return false;
+    };
+    match cause.kind {
+        ErrorKind::Unavailable => !refused_for_legal_reasons(cause),
+        ErrorKind::DeadlineExceeded | ErrorKind::Aborted => true,
+        // librespot files here what it cannot place, a failed name lookup
+        // or an unreachable network among them: only its own words tell.
+        ErrorKind::Unknown => {
+            let text = cause.error.to_string().to_lowercase();
+            [
+                "dns",
+                "lookup",
+                "no such host",
+                "unreachable",
+                "timed out",
+                "connection refused",
+                "connection reset",
+            ]
+            .iter()
+            .any(|sign| text.contains(sign))
+        }
+        _ => false,
+    }
+}
+
+/// Spotify turning a request away for legal reasons (HTTP 451), which
+/// librespot reports as unavailable like a server that is down. Asking
+/// again changes nothing.
+fn refused_for_legal_reasons(error: &librespot_core::Error) -> bool {
+    use librespot_core::http_client::HttpClientError;
+    matches!(
+        error.error.downcast_ref::<HttpClientError>(),
+        Some(HttpClientError::StatusCode(code))
+            if *code == ::http::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+    )
 }
 
 /// Whether a pickup in a context brought up `playing` rather than the track
@@ -4388,18 +4436,7 @@ fn friendly_connect_error(error: &anyhow::Error) -> String {
         REJECTED_SIGN_IN.to_string()
     } else if lower.contains("premium") {
         PREMIUM_NEEDED.to_string()
-    } else if [
-        "dns",
-        "connect",
-        "resolve",
-        "network",
-        "unreachable",
-        "timed out",
-        "deadline",
-    ]
-    .iter()
-    .any(|sign| lower.contains(sign))
-    {
+    } else if spotify_unreachable(error) {
         // Worth trying again: see `connect_failure_retryable`.
         format!("{UNREACHABLE}{text}")
     } else {
@@ -8567,29 +8604,99 @@ mod tests {
     /// The network can come back, so only a connection that could not reach
     /// Spotify is tried again. Everything else is shown, so the user is not
     /// left watching "Connecting" while the real error sits in the log.
+    /// librespot's report decides, not the engine's "unable to connect to
+    /// Spotify" around it, which reads like the network whatever happened.
     #[test]
     fn only_the_network_is_worth_retrying() {
-        assert!(connect_failure_retryable("Connecting to Spotify timed out"));
-        assert!(connect_failure_retryable(
-            "Couldn't reach Spotify: dns error: no such host"
-        ));
-        for unreachable in [
-            "error trying to connect: dns error",
-            "Deadline expired before operation could complete",
-            "Network is unreachable (os error 101)",
+        use librespot_core::Error as Librespot;
+        use librespot_core::http_client::HttpClientError;
+        use std::io::{Error as Io, ErrorKind};
+        let retried = |error: Librespot| {
+            let error = anyhow::Error::from(error).context("unable to connect to Spotify");
+            connect_failure_retryable(&friendly_connect_error(&error))
+        };
+        assert!(connect_failure_retryable(CONNECT_TIMED_OUT));
+        for (why, error) in [
+            (
+                "a refused connection",
+                Librespot::from(Io::from(ErrorKind::ConnectionRefused)),
+            ),
+            (
+                "no access point",
+                Librespot::unavailable("No access point available for endpoint accesspoint"),
+            ),
+            ("a timeout", Librespot::from(Io::from(ErrorKind::TimedOut))),
+            (
+                "a dropped connection",
+                Librespot::from(Io::from(ErrorKind::ConnectionReset)),
+            ),
+            (
+                "a failed name lookup",
+                Librespot::from(Io::other(
+                    "failed to lookup address information: Temporary failure in name resolution",
+                )),
+            ),
+            (
+                "a failed name lookup on Windows",
+                Librespot::from(Io::other("No such host is known. (os error 11001)")),
+            ),
+            (
+                "no network",
+                Librespot::from(Io::new(
+                    ErrorKind::NetworkUnreachable,
+                    "Network is unreachable (os error 101)",
+                )),
+            ),
         ] {
-            let error = anyhow::anyhow!(unreachable);
-            assert!(
-                connect_failure_retryable(&friendly_connect_error(&error)),
-                "{unreachable}"
-            );
+            assert!(retried(error), "{why}");
         }
+
+        for (why, error) in [
+            (
+                "a refused credential",
+                Librespot::permission_denied("Login failed with reason: Bad credentials"),
+            ),
+            (
+                "a travel restriction",
+                Librespot::permission_denied("Login failed with reason: Travel restriction"),
+            ),
+            (
+                "a banned app",
+                Librespot::permission_denied("Login failed with reason: Application banned"),
+            ),
+            (
+                "a plan without Premium",
+                Librespot::permission_denied("Login failed with reason: Premium account required"),
+            ),
+            (
+                "a refusal for legal reasons",
+                Librespot::from(HttpClientError::StatusCode(
+                    ::http::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                )),
+            ),
+            (
+                "a sign-in that keeps failing",
+                Librespot::failed_precondition("Couldn't successfully authenticate after 3 times"),
+            ),
+            (
+                "something librespot cannot place",
+                Librespot::unknown("unexpected packet from the access point"),
+            ),
+        ] {
+            assert!(!retried(error), "{why}");
+        }
+        let bad = anyhow::Error::from(Librespot::permission_denied(
+            "Login failed with reason: Bad credentials",
+        ))
+        .context("unable to connect to Spotify");
+        assert_eq!(friendly_connect_error(&bad), REJECTED_SIGN_IN);
         assert!(!connect_failure_retryable(REJECTED_SIGN_IN));
         assert!(!connect_failure_retryable(PREMIUM_NEEDED));
-        let bad = anyhow::anyhow!("authentication failed: BadCredentials");
-        assert!(!connect_failure_retryable(&friendly_connect_error(&bad)));
         assert!(!connect_failure_retryable("Local playback is unavailable"));
-        let cache = anyhow::anyhow!("Access is denied. (os error 5)");
+        // The engine's own words around a failure that is not librespot's
+        // say nothing about the network.
+        let cache = anyhow::anyhow!("Access is denied. (os error 5)")
+            .context("unable to connect to Spotify");
         assert!(!connect_failure_retryable(&friendly_connect_error(&cache)));
     }
 
