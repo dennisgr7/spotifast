@@ -83,6 +83,11 @@ const PLAYBACK_HOLD: Duration = Duration::from_secs(6);
 /// How close to its end a song counts as played out: picking it up there
 /// would end it at once.
 const PLAYED_OUT_MS: u32 = 2_000;
+/// The longest tracks failing while Windows reports no internet leave the
+/// session alone. Its hint can say so where Spotify still answers (behind
+/// a proxy, or with its check blocked), so it is for waiting, never for
+/// giving up.
+const OFFLINE_HINT_HOLD: Duration = Duration::from_secs(60);
 /// Delay before checking playback again after a command.
 const REMOTE_RECHECK: Duration = Duration::from_millis(1200);
 /// Delay before checking the queue after a local change.
@@ -297,7 +302,9 @@ pub struct App {
     /// where Spotify still answers (a proxy, a blocked probe), and Linux
     /// reports nothing.
     follows_reachability: bool,
-    /// The reachability the backend was last told.
+    /// The system's last word on reaching the internet. Where the app
+    /// follows it, the backend is told; elsewhere (Windows) its return is
+    /// only the moment to try again.
     reachable: bool,
     /// Keeps local playback out of App Nap while it plays (macOS).
     playback_activity: Option<crate::power::Activity>,
@@ -316,6 +323,10 @@ pub struct App {
     /// Where playback was when the last track failed offline, for when the
     /// skipping has stopped the player by the time the network is back.
     offline_resume: Option<Pickup>,
+    /// Until when tracks that failed while Windows said there is no
+    /// internet leave the session alone. Its hint can be wrong, so this
+    /// waits for the network a while but never gives up on it.
+    offline_hold_until: Option<Instant>,
     /// What the app may spend on drawing and polling, from the power state
     /// and the window's; worked out in each logic pass.
     pub budget: crate::power::Budget,
@@ -900,6 +911,7 @@ impl App {
             suspend_ack: None,
             failed_offline: false,
             offline_resume: None,
+            offline_hold_until: None,
             budget: crate::power::Budget::default(),
             motion: crate::motion::Motion::default(),
             window_hidden: false,
@@ -2299,6 +2311,7 @@ impl App {
                 // not pick it up when the network returns.
                 self.failed_offline = false;
                 self.offline_resume = None;
+                self.offline_hold_until = None;
                 self.local_ready = false;
                 self.local_device_id = None;
                 self.local_playback = LocalPlayback::Unavailable;
@@ -2357,17 +2370,32 @@ impl App {
         self.local_playback = status;
     }
 
-    fn on_network_restored(&mut self) {
+    /// Picks local playback up after tracks failed offline. librespot
+    /// marked them unavailable and skipped past them, so a new session
+    /// starts clean, where playback was: still playing from what had
+    /// loaded, or where the first track failed if the skipping stopped it.
+    fn pick_up_after_outage(&mut self) {
         if std::mem::take(&mut self.failed_offline) {
-            // librespot marked what failed offline unavailable and skipped
-            // past it. A new session starts clean, where playback was: still
-            // playing from what had loaded, or where the first track failed
-            // if the skipping stopped it.
             let resume = self
                 .local_pickup(&self.local)
                 .or(self.offline_resume.take());
             self.backend.send(Command::Reconnect { resume });
         }
+    }
+
+    /// Windows reports the network back. Its hint holds nothing up, but
+    /// its return is the moment to try again: music that failed while it
+    /// said there was none picks up at once, a session waiting for its next
+    /// try goes now, and the other devices get a fresh look.
+    fn on_network_hint_returned(&mut self) {
+        self.offline_hold_until = None;
+        self.pick_up_after_outage();
+        self.backend.send(Command::NetworkReturned);
+        self.poll_remote_soon();
+    }
+
+    fn on_network_restored(&mut self) {
+        self.pick_up_after_outage();
         if !self.is_connected() {
             return;
         }
@@ -2678,11 +2706,21 @@ impl App {
         {
             controls.seeked(Duration::from_millis(u64::from(state.position_ms)));
         }
+        // A track that loads shows Spotify answers, whatever Windows says:
+        // the hold is lifted, and failures count as they do online.
+        if self.offline_hold_until.is_some() && state.track_sequence != self.local.track_sequence {
+            self.offline_hold_until = None;
+            self.failed_offline = false;
+            self.offline_resume = None;
+        }
         if let Some(error) = &state.error
             && self.local.error.as_deref() != Some(error.as_str())
         {
             let unavailable = error.starts_with("This item isn't available");
-            if unavailable && !self.network_reachable {
+            // Windows's hint, which the backend does not follow, still
+            // tells why tracks fail; it holds the session a while at most.
+            let hinted_offline = !self.follows_reachability && !self.power.conditions().online;
+            if unavailable && (!self.network_reachable || hinted_offline) {
                 // Without internet every track fails the same way and
                 // librespot skips on through the list. Nothing is wrong with
                 // the tracks or the session: say so once, and start a clean
@@ -2694,6 +2732,9 @@ impl App {
                 }
                 if !self.failed_offline {
                     self.failed_offline = true;
+                    if hinted_offline {
+                        self.offline_hold_until = Some(Instant::now() + OFFLINE_HINT_HOLD);
+                    }
                     self.toast(gettext(self.locale, "You're offline"));
                 }
             } else {
@@ -11143,8 +11184,8 @@ impl App {
 
     /// Follows the system's power and session state: works out the budget
     /// for drawing and polling, tells the backend whether the internet can
-    /// be reached, keeps local playback out of App Nap, and answers what the
-    /// system is about to do.
+    /// be reached (on Windows, only that it is back), keeps local playback
+    /// out of App Nap, and answers what the system is about to do.
     fn sync_power(&mut self, ctx: &egui::Context) {
         let conditions = self.power.conditions();
         let shown =
@@ -11157,9 +11198,23 @@ impl App {
             self.power
                 .set_background(budget == crate::power::Budget::Background);
         }
-        if self.follows_reachability && conditions.online != self.reachable {
+        if conditions.online != self.reachable {
             self.reachable = conditions.online;
-            self.backend.network_status(conditions.online);
+            if self.follows_reachability {
+                self.backend.network_status(conditions.online);
+            } else if conditions.online {
+                self.on_network_hint_returned();
+            }
+        }
+        // Windows's hint may say there is no internet where Spotify answers:
+        // after a while, music that failed while it said so picks up as if
+        // the network were back, without the notice a broken session gets.
+        if self
+            .offline_hold_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.offline_hold_until = None;
+            self.pick_up_after_outage();
         }
         if crate::power::playback_needs_activity(&self.local) {
             self.playback_activity
@@ -11271,8 +11326,9 @@ impl App {
         }
     }
 
-    /// The soonest that playback, a pending play or polling needs the logic
-    /// to run again, if any of them does.
+    /// The soonest that playback, a pending play, polling or the end of a
+    /// hold on Windows's offline hint needs the logic to run again, if any
+    /// of them does.
     fn next_pass(&self) -> Option<Duration> {
         let playing = self
             .now_playing()
@@ -11284,7 +11340,13 @@ impl App {
         let polling = self
             .is_connected()
             .then(|| self.connected_repaint_interval());
-        [playing, pending, polling].into_iter().flatten().min()
+        let offline_hold = self
+            .offline_hold_until
+            .map(|until| until.saturating_duration_since(Instant::now()));
+        [playing, pending, polling, offline_hold]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// How long the headless loop may sleep after this tick: until the next
@@ -21559,6 +21621,183 @@ mod tests {
         assert_eq!(resume.context_uri.as_deref(), Some("spotify:album:a"));
         assert_eq!(resume.offset_uri.as_deref(), Some("spotify:track:shown"));
         assert_eq!(resume.position_ms, 119_000);
+    }
+
+    /// Playing in an album as on Windows, where the backend does not follow
+    /// the system's hint on the internet: the hint goes, and three tracks
+    /// fail. Returns the state they failed from.
+    fn failing_under_a_windows_offline_hint(app: &mut App, ctx: &egui::Context) -> LocalState {
+        app.follows_reachability = false;
+        let playing = playing_in_an_album(app);
+        app.handle_local(playing.clone());
+        app.toasts.clear();
+        change_power(app, |conditions| conditions.online = false);
+        app.sync_power(ctx);
+        for uri in ["spotify:track:b", "spotify:track:c", "spotify:track:d"] {
+            app.handle_local(unavailable(&playing, uri));
+        }
+        playing
+    }
+
+    fn assert_picked_up_in_the_album(reconnects: &[Option<Pickup>]) {
+        let [Some(pickup)] = reconnects else {
+            panic!("one reconnect with a resume point, got {reconnects:?}");
+        };
+        let resume = &pickup.load;
+        assert_eq!(resume.context_uri.as_deref(), Some("spotify:album:a"));
+        assert_eq!(resume.offset_uri.as_deref(), Some("spotify:track:shown"));
+        assert_eq!(resume.position_ms, 119_000);
+        assert!(resume.play);
+    }
+
+    /// Windows's hint that there is no internet is said once and leaves the
+    /// session alone, though the backend never hears of it. When the hint
+    /// comes back, a clean session picks up in the album at the same track
+    /// and position, and a session waiting for its next try hurries.
+    #[test]
+    fn a_windows_offline_hint_waits_and_picks_up_when_it_returns() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        let playing = failing_under_a_windows_offline_hint(&mut app, &ctx);
+        assert_eq!(app.toasts.len(), 1, "said once: {:?}", app.toasts);
+        assert!(app.backend.take_reconnects().is_empty(), "left alone");
+
+        app.handle_local(LocalState {
+            playback: Playback::Stopped,
+            position_ms: 0,
+            ..playing
+        });
+        change_power(&app, |conditions| conditions.online = true);
+        app.sync_power(&ctx);
+        assert_picked_up_in_the_album(&app.backend.take_reconnects());
+        assert_eq!(app.backend.take_network_returns(), 1);
+        assert_eq!(app.offline_hold_until, None);
+        assert!(
+            app.backend.take_network_statuses().is_empty(),
+            "the backend never waits for Windows's hint"
+        );
+    }
+
+    /// Windows's hint can say there is no internet where Spotify answers
+    /// (a proxy, a blocked check), so it holds the session a minute at
+    /// most. Then a clean session picks up where playback was, without the
+    /// notice a broken session gets, and the logic runs in time for it.
+    #[test]
+    fn a_windows_offline_hint_holds_the_session_a_minute_at_most() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        let playing = failing_under_a_windows_offline_hint(&mut app, &ctx);
+        app.handle_local(LocalState {
+            playback: Playback::Stopped,
+            position_ms: 0,
+            ..playing
+        });
+        let held = app.offline_hold_until.expect("held");
+        assert!(held <= Instant::now() + OFFLINE_HINT_HOLD);
+        assert!(
+            app.next_pass()
+                .is_some_and(|due| due > Duration::from_secs(50) && due <= OFFLINE_HINT_HOLD),
+            "the next pass comes when the hold ends: {:?}",
+            app.next_pass()
+        );
+        app.sync_power(&ctx);
+        assert!(
+            app.backend.take_reconnects().is_empty(),
+            "within the minute"
+        );
+
+        // The minute is up and Windows still says there is no internet.
+        app.offline_hold_until = Some(Instant::now());
+        app.sync_power(&ctx);
+        assert_picked_up_in_the_album(&app.backend.take_reconnects());
+        assert_eq!(app.toasts.len(), 1, "only the offline notice");
+        assert_eq!(app.offline_hold_until, None);
+        assert!(!app.failed_offline);
+
+        // Nothing is picked up twice when the hint comes back.
+        change_power(&app, |conditions| conditions.online = true);
+        app.sync_power(&ctx);
+        assert!(app.backend.take_reconnects().is_empty());
+    }
+
+    /// A track that loads while Windows says there is no internet shows the
+    /// hint is wrong: the hold is lifted, and the music playing is left
+    /// alone when the hint comes back.
+    #[test]
+    fn a_track_that_plays_lifts_the_offline_hold() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        let playing = failing_under_a_windows_offline_hint(&mut app, &ctx);
+        assert!(app.offline_hold_until.is_some());
+
+        app.handle_local(LocalState {
+            track: Some(crate::player::LocalTrack {
+                uri: "spotify:track:e".into(),
+                duration_ms: 200_000,
+                ..Default::default()
+            }),
+            track_sequence: playing.track_sequence + 1,
+            position_ms: 0,
+            ..playing
+        });
+        assert_eq!(app.offline_hold_until, None);
+        assert!(!app.failed_offline);
+
+        change_power(&app, |conditions| conditions.online = true);
+        app.sync_power(&ctx);
+        assert!(
+            app.backend.take_reconnects().is_empty(),
+            "replaced the session that plays"
+        );
+    }
+
+    /// Windows's hint coming back hurries a session waiting for its next
+    /// try, once each time; the backend is never told of it. Where the app
+    /// follows the system's word (macOS), the backend is told instead.
+    #[test]
+    fn the_windows_hint_coming_back_hurries_a_waiting_session() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.follows_reachability = false;
+        change_power(&app, |conditions| conditions.online = false);
+        app.sync_power(&ctx);
+        app.sync_power(&ctx);
+        assert_eq!(app.backend.take_network_returns(), 0);
+        change_power(&app, |conditions| conditions.online = true);
+        app.sync_power(&ctx);
+        app.sync_power(&ctx);
+        assert_eq!(app.backend.take_network_returns(), 1);
+        assert!(app.backend.take_network_statuses().is_empty());
+
+        app.follows_reachability = true;
+        change_power(&app, |conditions| conditions.online = false);
+        app.sync_power(&ctx);
+        change_power(&app, |conditions| conditions.online = true);
+        app.sync_power(&ctx);
+        assert_eq!(app.backend.take_network_returns(), 0);
+        assert_eq!(app.backend.take_network_statuses(), [false, true]);
+    }
+
+    /// Linux says nothing about the internet, which reads as online: three
+    /// tracks failing in a row still replace the session, with its notice.
+    #[test]
+    fn without_a_hint_three_failing_tracks_still_replace_the_session() {
+        let mut app = headless_app();
+        app.follows_reachability = false;
+        let playing = playing_in_an_album(&mut app);
+        app.handle_local(playing.clone());
+        app.toasts.clear();
+        for uri in ["spotify:track:b", "spotify:track:c", "spotify:track:d"] {
+            app.handle_local(unavailable(&playing, uri));
+        }
+        assert_eq!(app.backend.take_reconnects().len(), 1);
+        let notice = gettext(
+            app.locale,
+            "Spotify audio disconnected. Reconnecting local playback",
+        );
+        assert!(app.toasts.iter().any(|toast| toast.message == notice));
+        assert_eq!(app.offline_hold_until, None);
+        assert!(!app.failed_offline);
     }
 
     /// eframe runs only the logic of a hidden, minimised or occluded window,

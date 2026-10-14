@@ -444,28 +444,36 @@ playback state. If the session drops, it reconnects with the stored credential.
 On macOS, while the system reports no route to the internet at all, the
 reconnection waits for one instead of retrying. Spotifast asks the system
 about the internet as a whole rather than about a Spotify host, so the check
-looks up no name and sends nothing over the network.
+looks up no name and sends nothing over the network. Windows reports the
+internet too, but it can say there is none behind a proxy or when its own
+check is blocked, so nothing waits for its report; it only makes a waiting
+reconnection try again at once when the network is back.
 
 A reconnection that cannot reach Spotify (a timeout, or a DNS, connection or
 network error, as librespot reports it), for example because the network is
 not back yet after the computer wakes, keeps what was playing and tries again
 after 2 seconds, then 4, 8 and so on up to once a minute, and at once when
-macOS reports the network back. The same applies when the stored credential
-cannot connect at start-up. Any other failure, such as Spotify refusing the
-credential, an account without Premium, or a travel restriction, stops it and
-shows the error, and then **Try again** opens the browser; after a network
-failure it reconnects with the stored credential instead.
+macOS or Windows reports the network back. The same applies when the stored
+credential cannot connect at start-up. Any other failure, such as Spotify
+refusing the credential, an account without Premium, or a travel restriction,
+stops it and shows the error, and then **Try again** opens the browser; after
+a network failure it reconnects with the stored credential instead.
 
 Without internet, every track librespot tries to load fails, and it marks each
 one unavailable and skips to the next. On macOS, while the system reports no
 internet, the app says so once instead of once per track, leaves the session
-alone, and replaces it when the network is back, so the marks go with it.
-Elsewhere, three tracks failing within 20 seconds replace the session, which
-then tries again as above. A session replaced while it still runs can hand
-over only its track, so the app gives the new one the album, playlist or list
-around it as well, with the track and position shown when the last load
-failed. A track that autoplay added after its album or playlist is not part of
-it, so it comes back by itself, or, once it has played out, its radio follows.
+alone, and replaces it when the network is back, so the marks go with it. On
+Windows, while it reports no internet, the app also says so once and leaves
+the session alone, but for a minute at most, in case the report is wrong: it
+replaces the session as soon as Windows reports the network back, or when the
+minute is up, and a track that plays in the meantime ends the wait.
+Otherwise, and always on Linux, which reports nothing, three tracks failing
+within 20 seconds replace the session, which then tries again as above. A
+session replaced while it still runs can hand over only its track, so the app
+gives the new one the album, playlist or list around it as well, with the
+track and position shown when the last load failed. A track that autoplay
+added after its album or playlist is not part of it, so it comes back by
+itself, or, once it has played out, its radio follows.
 
 On Windows and Linux, which report sleep and waking, music playing on this
 computer pauses before it sleeps and the session is saved; the system is held

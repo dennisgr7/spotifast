@@ -694,6 +694,10 @@ pub enum Command {
     },
     /// OS reports network reachability changed.
     NetworkStatus(bool),
+    /// Windows reports the network back. Its hint is not followed, so
+    /// nothing waits for it; this only hurries a dropped session waiting
+    /// for its next try.
+    NetworkReturned,
     /// librespot's session ended on its own, or the app saw it go bad.
     /// `resume`, when given, is where playback picks up on the new session:
     /// the app knows the album or playlist, which a session replaced while
@@ -1040,6 +1044,8 @@ pub struct Backend {
     reconnects: std::sync::Mutex<Vec<Option<Pickup>>>,
     #[cfg(test)]
     system_resumes: std::sync::Mutex<Vec<Option<Pickup>>>,
+    #[cfg(test)]
+    network_returns: std::sync::atomic::AtomicUsize,
 }
 
 impl Backend {
@@ -1138,6 +1144,8 @@ impl Backend {
             reconnects: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             system_resumes: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            network_returns: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1180,6 +1188,10 @@ impl Backend {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(resume.clone()),
+            Command::NetworkReturned => {
+                self.network_returns
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             _ => {}
         }
         if self.offline
@@ -1413,6 +1425,14 @@ impl Backend {
     #[cfg(test)]
     pub(crate) fn take_system_resumes(&self) -> Vec<Option<Pickup>> {
         std::mem::take(&mut *self.system_resumes.lock().unwrap())
+    }
+
+    /// How many times Windows's report of the network back was passed on
+    /// since the last call.
+    #[cfg(test)]
+    pub(crate) fn take_network_returns(&self) -> usize {
+        self.network_returns
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn player(&self, command: PlayerCommand) {
@@ -2069,6 +2089,7 @@ impl Worker {
                 }
                 Command::SystemResumed { asleep, resume } => self.on_system_resumed(asleep, resume),
                 Command::PauseForSleep => self.pause_for_sleep(),
+                Command::NetworkReturned => self.retry_engine_now(),
                 Command::RetryPlayback => {
                     if self.playback_grant.is_some() && self.engine_failure_retryable {
                         self.engine_retry = Some(0);
@@ -3240,8 +3261,9 @@ impl Worker {
     }
 
     /// Tries a dropped session again now, if one is waiting to: when its wait
-    /// is over, on **Try again**, or on waking. The network's return goes
-    /// through `waiting_for_network` instead.
+    /// is over, on **Try again**, on waking, or when Windows reports the
+    /// network back. macOS's report goes through `waiting_for_network`
+    /// instead.
     fn retry_engine_now(&mut self) {
         if self.engine_retry.is_none() || self.engine.is_some() || self.engine_busy {
             return;
@@ -8775,6 +8797,74 @@ mod tests {
                 .try_iter()
                 .all(|event| !matches!(event, Event::Playback(LocalPlayback::Failed(_))))
         );
+    }
+
+    /// Windows reporting the network back hurries a dropped session waiting
+    /// out the wait before its next try. Its hint is not followed: the
+    /// backend never waited for it.
+    #[test]
+    fn the_network_back_on_windows_hurries_a_waiting_session() {
+        let (runtime, mut worker, events) = super::authorization_tests::worker("network-returned");
+        let _entered = runtime.enter();
+        super::authorization_tests::verify(&mut worker, ApiSource::Shared, "alice");
+        worker.playback_grant = Some(Credentials::with_password("alice", "grant"));
+        worker.engine_retry = Some(3);
+        let scheduled = worker.engine_retry_generation;
+
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands.send(Command::NetworkReturned).unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+
+        assert!(worker.engine_busy, "tried at once");
+        assert_ne!(
+            worker.engine_retry_generation, scheduled,
+            "the try scheduled for later is stale"
+        );
+        assert!(worker.network_reachable);
+        assert!(!worker.waiting_for_network);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Playback(LocalPlayback::Connecting)))
+        );
+    }
+
+    /// The network coming back on Windows leaves alone a session that is
+    /// connecting, and one that runs, which has no try waiting.
+    #[test]
+    fn the_network_back_on_windows_leaves_a_working_session_alone() {
+        for (name, connecting) in [
+            ("network-returned-connecting", true),
+            ("network-returned-running", false),
+        ] {
+            let (runtime, mut worker, events) = super::authorization_tests::worker(name);
+            let _entered = runtime.enter();
+            super::authorization_tests::verify(&mut worker, ApiSource::Shared, "alice");
+            worker.playback_grant = Some(Credentials::with_password("alice", "grant"));
+            worker.engine_busy = connecting;
+            worker.engine_retry = connecting.then_some(1);
+            let attempt = worker.engine_attempt;
+            let scheduled = worker.engine_retry_generation;
+
+            let (commands, receiver) = mpsc::unbounded_channel();
+            commands.send(Command::NetworkReturned).unwrap();
+            commands.send(Command::Shutdown).unwrap();
+            runtime.block_on(worker.run(receiver));
+
+            assert_eq!(worker.engine_attempt, attempt, "{name}: tried again");
+            assert_eq!(worker.engine_busy, connecting, "{name}");
+            assert_eq!(
+                worker.engine_retry_generation, scheduled,
+                "{name}: the scheduled try was dropped"
+            );
+            assert!(
+                events
+                    .try_iter()
+                    .all(|event| !matches!(event, Event::Playback(LocalPlayback::Connecting))),
+                "{name}"
+            );
+        }
     }
 
     #[test]
