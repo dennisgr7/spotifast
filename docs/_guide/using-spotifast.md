@@ -499,12 +499,13 @@ visualizer** in **Settings > Appearance** to prevent accidental changes.
 
 Spotifast follows the system when it asks for less motion: **Animation
 effects** turned off in Windows, **Reduce motion** on macOS, or GNOME's
-**Animations** turned off. Its animations then show where they end at once:
-glows and the player bar's colour change without fading, the wave appears and
-goes without growing or settling, lyrics jump to the sung line, and a new
-theme replaces the old one without the reveal. Spinners still turn. The page
-header's glow fades at the visualizers' frame rate, and not at all while
-nobody can see the window.
+**Animations** turned off. Its animations then show where they end at once: a
+cover opens its page without flying into it, glows and the player bar's colour
+change without fading, the wave appears and goes without growing or settling,
+lyrics jump to the sung line, and a new theme replaces the old one without the
+reveal. Spinners still turn. The page header's glow and a cover flying into
+its page draw at the visualizers' frame rate, and not at all while nobody can
+see the window.
 
 In **Settings > Appearance**, **Compact track list** puts each song on one
 line. In narrow lists, the added date follows the artist credits with a spaced

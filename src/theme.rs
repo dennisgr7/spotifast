@@ -925,6 +925,15 @@ fn next_beat(due: f64, now: f64, interval: f64) -> f64 {
     }
 }
 
+/// The shortest gap, in seconds, between the frames [`visualiser_frame`]
+/// asks for at `rate`: none of its own uncapped, when the display sets it.
+pub fn visualiser_interval(rate: Option<u32>) -> f64 {
+    match rate {
+        Some(rate) if rate > 0 => 1.0 / f64::from(rate),
+        _ => 0.0,
+    }
+}
+
 /// An animated busy indicator paced independently of the graphics driver.
 pub fn spinner(ui: &mut egui::Ui, size: f32, color: Color32) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());

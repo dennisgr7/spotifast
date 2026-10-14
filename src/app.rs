@@ -421,6 +421,10 @@ pub struct App {
     /// back in the Dock as it launches).
     #[cfg(target_os = "macos")]
     dock_icon_shown: Option<bool>,
+    /// A clicked cover waiting for the page its click opens.
+    cover_origin: Option<CoverOrigin>,
+    /// A cover flying from where it was clicked into its page's header.
+    pub cover_flight: Option<crate::ui::flight::CoverFlight>,
     pub window_hidden: bool,
     /// The window should close but the process should stay in the tray.
     pub hide_intent: bool,
@@ -1172,6 +1176,8 @@ impl App {
             motion: crate::motion::Motion::default(),
             #[cfg(target_os = "macos")]
             dock_icon_shown: None,
+            cover_origin: None,
+            cover_flight: None,
             window_hidden: false,
             hide_intent: false,
             wants_show: false,
@@ -1458,8 +1464,11 @@ impl App {
         theme::install(ctx);
         ctx.add_bytes_loader(std::sync::Arc::new(self.backend.art().clone()));
         ctx.add_image_loader(std::sync::Arc::new(self.backend.art().scaler()));
-        // The covers the last window's egui held are gone with it.
+        // The covers the last window's egui held are gone with it, and so
+        // is a cover in flight there: the new window's clock starts again.
         self.backend.art().forget_textures();
+        self.cover_flight = None;
+        self.cover_origin = None;
         ctx.set_theme(self.theme_preference());
         self.applied_dark = None;
         self.winamp.forget_textures();
@@ -2636,6 +2645,14 @@ impl App {
                             .filter_map(|track| track.album.as_ref())
                             .find(|album| album.id == id)
                     })
+                })
+            })
+            .or_else(|| {
+                self.home.recently_played.get().and_then(|history| {
+                    history
+                        .iter()
+                        .filter_map(|played| played.track.album.as_ref())
+                        .find(|album| album.id == id)
                 })
             })
     }
@@ -11590,6 +11607,8 @@ impl App {
             }
             actions = std::mem::take(&mut self.actions);
         }
+        // A clicked cover only flies into a page opened by the same click.
+        self.cover_origin = None;
     }
 
     fn leave_lyrics_fullscreen(&mut self, ctx: &egui::Context) {
@@ -11674,7 +11693,49 @@ impl App {
             self.supersede_play_search();
         }
         match action {
-            Action::Open(page) => self.open(page),
+            Action::FlyCover(origin) => {
+                self.cover_origin = (!self.motion.reduced()).then_some(origin);
+            }
+            Action::EndCoverFlight(page) => {
+                if self
+                    .cover_flight
+                    .as_ref()
+                    .is_some_and(|flight| flight.page == page)
+                {
+                    self.cover_flight = None;
+                }
+            }
+            Action::HoldCoverFlight(page) => {
+                let now = ctx.input(|input| input.time);
+                if let Some(flight) = self
+                    .cover_flight
+                    .as_mut()
+                    .filter(|flight| flight.page == page)
+                {
+                    flight.hold(now);
+                }
+            }
+            Action::Open(page) => {
+                let before = self.page().clone();
+                self.open(page);
+                // A second click on what opened this page, as the second
+                // half of a double click on a library row, opens nothing new
+                // and leaves its cover in the air.
+                if *self.page() != before {
+                    let now = ctx.input(|input| input.time);
+                    self.cover_flight =
+                        self.cover_origin
+                            .take()
+                            .map(|origin| crate::ui::flight::CoverFlight {
+                                origin,
+                                page: self.page().clone(),
+                                start: now,
+                                opened: now,
+                                held: false,
+                                pace: Default::default(),
+                            });
+                }
+            }
             Action::OpenSongRadio { uri, track } => self.open_song_radio(&uri, &track),
             Action::PrepareTint(url) => {
                 if self.settings.accent_from_art {
@@ -11695,6 +11756,7 @@ impl App {
                 self.actions.push(Action::ShowWindow);
             }
             Action::Back => {
+                self.cover_flight = None;
                 if self.can_go_back() {
                     self.pending_link = None;
                     self.prerelease_request = None;
@@ -11707,6 +11769,7 @@ impl App {
                 }
             }
             Action::Forward => {
+                self.cover_flight = None;
                 if self.can_go_forward() {
                     self.pending_link = None;
                     self.prerelease_request = None;
@@ -13856,6 +13919,12 @@ impl App {
             && !(self.is_connected() && self.user.is_none());
         if self.settings.winamp_window && needs_sign_in && !self.switch_intent {
             self.actions.push(Action::ToggleWinampWindow);
+        }
+        // Paced before anything draws, so the page header and the cover
+        // flying into it read the same start.
+        let frame = theme::visualiser_interval(self.visualiser_fps());
+        if let Some(flight) = self.cover_flight.as_mut() {
+            flight.pace(ctx.input(|input| input.time), frame);
         }
         if self.settings.winamp_window {
             crate::ui::winamp::show(self, ui);
@@ -22880,6 +22949,8 @@ mod tests {
         assert_eq!(app.palette, Palette::light(), "no picture came: apply");
     }
 
+    /// Albums are known from liked songs, playlists' songs and Home's
+    /// Recently played, so their pages open with a header.
     #[test]
     fn known_albums_include_liked_and_playlist_tracks() {
         let mut app = test_app("known-track-albums");
@@ -22911,11 +22982,23 @@ mod tests {
             },
         );
 
+        app.home.recently_played = Loadable::Loaded(vec![crate::api::models::PlayHistory {
+            track: Track {
+                album: Some(album("recent-album")),
+                ..Default::default()
+            },
+            played_at: None,
+            context: None,
+        }]);
+
         assert_eq!(app.known_album("liked-album").unwrap().id, "liked-album");
         assert_eq!(
             app.known_album("playlist-album").unwrap().id,
             "playlist-album"
         );
+        // An album opened from Home's Recently played shows its name and
+        // cover at once, and its cover has a header to fly into.
+        assert_eq!(app.known_album("recent-album").unwrap().id, "recent-album");
         app.backend.shutdown();
     }
 
