@@ -719,6 +719,14 @@ pub enum Command {
     /// The system is about to sleep: music playing here pauses at once, and
     /// a pickup still on its way to a session wakes paused.
     PauseForSleep,
+    /// Tells the system to go ahead with the sleep once the player here has
+    /// paused for it, or at `by` at the latest: the system waits 1.5 s at
+    /// most, and the interface's next pass may not run in time once the
+    /// display is off.
+    AnswerSleep {
+        ack: crate::power::Ack,
+        by: Instant,
+    },
     /// "Try again" after local playback failed: reconnects with the stored
     /// credential when the failure was the network, and asks the browser
     /// again only when Spotify turned the credential down.
@@ -1046,6 +1054,8 @@ pub struct Backend {
     system_resumes: std::sync::Mutex<Vec<Option<Pickup>>>,
     #[cfg(test)]
     network_returns: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    sleep_answers: std::sync::Mutex<Vec<Instant>>,
 }
 
 impl Backend {
@@ -1146,6 +1156,8 @@ impl Backend {
             system_resumes: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             network_returns: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            sleep_answers: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1192,6 +1204,11 @@ impl Backend {
                 self.network_returns
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            Command::AnswerSleep { by, .. } => self
+                .sleep_answers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(*by),
             _ => {}
         }
         if self.offline
@@ -1205,6 +1222,10 @@ impl Backend {
                     | Command::InstallUpdate { .. }
             )
         {
+            // No player here to wait for: the system goes ahead at once.
+            if let Command::AnswerSleep { ack, .. } = &command {
+                ack.done();
+            }
             return;
         }
         let _ = self.commands.send(command);
@@ -1425,6 +1446,12 @@ impl Backend {
     #[cfg(test)]
     pub(crate) fn take_system_resumes(&self) -> Vec<Option<Pickup>> {
         std::mem::take(&mut *self.system_resumes.lock().unwrap())
+    }
+
+    /// The sleeps handed over to answer so far, each with its latest answer.
+    #[cfg(test)]
+    pub(crate) fn take_sleep_answers(&self) -> Vec<Instant> {
+        std::mem::take(&mut *self.sleep_answers.lock().unwrap())
     }
 
     /// How many times Windows's report of the network back was passed on
@@ -2089,6 +2116,7 @@ impl Worker {
                 }
                 Command::SystemResumed { asleep, resume } => self.on_system_resumed(asleep, resume),
                 Command::PauseForSleep => self.pause_for_sleep(),
+                Command::AnswerSleep { ack, by } => self.answer_sleep(ack, by),
                 Command::NetworkReturned => self.retry_engine_now(),
                 Command::RetryPlayback => {
                     if self.playback_grant.is_some() && self.engine_failure_retryable {
@@ -3287,6 +3315,20 @@ impl Worker {
         {
             log::warn!("unable to pause for sleep: {error}");
         }
+    }
+
+    /// Answers the system once the player here has paused for the sleep,
+    /// or at `by`, whichever is first, waiting off this loop.
+    fn answer_sleep(&self, ack: crate::power::Ack, by: Instant) {
+        let Some(engine) = &self.engine else {
+            ack.done();
+            return;
+        };
+        tokio::spawn(answer_once_paused(
+            move || ack.done(),
+            by,
+            engine.playing_probe(),
+        ));
     }
 
     /// A pickup still on its way to a session, a reconnect queued or one
@@ -7051,6 +7093,58 @@ mod authorization_tests {
         assert!(worker.pickup_paused, "a session's snapshot is paused too");
     }
 
+    /// The system is told to sleep as soon as the player has paused, when
+    /// the wait is up if it never does, and at once when nothing plays.
+    #[tokio::test(start_paused = true)]
+    async fn a_sleep_is_answered_once_the_player_pauses_or_the_wait_is_up() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = |value| Arc::new(AtomicBool::new(value));
+        let answer = |answered: &Arc<AtomicBool>| {
+            let answered = answered.clone();
+            move || answered.store(true, Ordering::SeqCst)
+        };
+        let probe = |playing: &Arc<AtomicBool>| {
+            let playing = playing.clone();
+            move || playing.load(Ordering::SeqCst)
+        };
+        let wait = Duration::from_secs(1);
+
+        let (playing, answered) = (flag(true), flag(false));
+        let started = tokio::time::Instant::now();
+        let waiting = tokio::spawn(answer_once_paused(
+            answer(&answered),
+            Instant::now() + wait,
+            probe(&playing),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!answered.load(Ordering::SeqCst), "still playing");
+        playing.store(false, Ordering::SeqCst);
+        waiting.await.unwrap();
+        assert!(answered.load(Ordering::SeqCst));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "answered as soon as it paused"
+        );
+
+        let (playing, answered) = (flag(true), flag(false));
+        let started = tokio::time::Instant::now();
+        answer_once_paused(answer(&answered), Instant::now() + wait, probe(&playing)).await;
+        assert!(
+            answered.load(Ordering::SeqCst),
+            "a player that never pauses"
+        );
+        assert!(
+            (Duration::from_millis(990)..Duration::from_millis(1100)).contains(&started.elapsed()),
+            "holds the system no longer than the wait"
+        );
+
+        let (playing, answered) = (flag(false), flag(false));
+        let started = tokio::time::Instant::now();
+        answer_once_paused(answer(&answered), Instant::now() + wait, probe(&playing)).await;
+        assert!(answered.load(Ordering::SeqCst));
+        assert_eq!(started.elapsed(), Duration::ZERO, "nothing to wait for");
+    }
+
     /// The system can sleep before the notice that pauses a waiting pickup
     /// is sent. A dropped session waiting for its next try then wakes paused
     /// all the same, with its own pickup rather than the app's.
@@ -8447,6 +8541,32 @@ mod cover_routing_tests {
             Operation::PlaylistMutation(PlaylistAccess::Collaborative)
         );
     }
+}
+
+/// How often a sleep waiting on the player looks again.
+const SLEEP_ANSWER_POLL: Duration = Duration::from_millis(10);
+
+/// Calls `answer` once `playing` says the player has stopped, or at `by`.
+/// The log says which, and how long this waited.
+async fn answer_once_paused(answer: impl FnOnce(), by: Instant, playing: impl Fn() -> bool) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + by.saturating_duration_since(Instant::now());
+    while playing() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(SLEEP_ANSWER_POLL).await;
+    }
+    // Not a warning: a player whose pause waits for an audio device that
+    // stopped taking samples as the system went to sleep reaches the
+    // deadline on every sleep, and the system then sleeps paused all the
+    // same.
+    if playing() {
+        log::info!(
+            "the player had not reported its pause for sleep after waiting {:?}; letting the system sleep",
+            started.elapsed()
+        );
+    } else {
+        log::info!("paused for sleep after waiting {:?}", started.elapsed());
+    }
+    answer();
 }
 
 #[cfg(test)]

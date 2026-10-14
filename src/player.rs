@@ -488,11 +488,14 @@ impl Engine {
     /// Whether music is playing, or loading to play, here. Reads the state
     /// without taking the point a dropped session saved.
     pub fn is_playing(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupted()
-            .is_some_and(|now| now.playing)
+        playing_in(&self.state)
+    }
+
+    /// [`is_playing`](Self::is_playing), to ask later from another task
+    /// without holding on to the engine.
+    pub fn playing_probe(&self) -> impl Fn() -> bool + Send + 'static {
+        let state = self.state.clone();
+        move || playing_in(&state)
     }
 
     pub fn device_id(&self) -> &str {
@@ -1182,6 +1185,16 @@ fn decode_folder_name(encoded: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether `state` has music playing, or loading to play, without taking
+/// the point a dropped session saved.
+fn playing_in(state: &Mutex<LocalState>) -> bool {
+    state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .interrupted()
+        .is_some_and(|now| now.playing)
 }
 
 #[cfg(test)]

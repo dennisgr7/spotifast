@@ -51,6 +51,10 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
 /// suspend (3 s at the end of a session), so a longer wait would only
 /// answer after the system has gone ahead without us.
 const SUSPEND_FLUSH_TIMEOUT: Duration = Duration::from_millis(1500);
+/// The longest the backend waits for the player to pause before it lets
+/// the system sleep, from when a pass saw the notice: the system itself
+/// waits 1.5 s at most.
+const SLEEP_ANSWER_WAIT: Duration = Duration::from_secs(1);
 /// How old the saved resume point may grow while music plays.
 const SESSION_REFRESH: Duration = Duration::from_secs(30);
 /// The longest the app sleeps in the tray with nothing due.
@@ -313,9 +317,6 @@ pub struct App {
     /// fastframe-power's `Power::take_suspended_at` (crmne/fastframe#24)
     /// will note it on the reader, as the system says so.
     suspended_at: Option<std::time::SystemTime>,
-    /// The system waits to sleep until the local player has paused; this
-    /// answers it once the player says so.
-    suspend_ack: Option<crate::power::Ack>,
     /// Tracks failed to load while there was no internet. librespot then
     /// marks them unavailable and skips on, so the session is replaced
     /// once the network is back, picking up where playback was before.
@@ -908,7 +909,6 @@ impl App {
             reachable: true,
             playback_activity: None,
             suspended_at: None,
-            suspend_ack: None,
             failed_offline: false,
             offline_resume: None,
             offline_hold_until: None,
@@ -11226,6 +11226,7 @@ impl App {
             use crate::power::Event;
             match event {
                 Event::Suspending(ack) => {
+                    let seen = Instant::now();
                     // The backend pauses the player by what it is doing, not
                     // by what is shown, and keeps a pickup still on its way
                     // to a session paused. Sent from here until
@@ -11264,11 +11265,16 @@ impl App {
                     // to go ahead.
                     self.flush_files();
                     if player_playing {
-                        // Answered below once the player has paused: an
-                        // answer now lets the system sleep before the pause
-                        // reaches the player, which then picks it up on
-                        // waking, mid-write.
-                        self.suspend_ack = Some(ack);
+                        // The backend answers once the player has paused:
+                        // an answer now lets the system sleep before the
+                        // pause reaches the player, which then picks it up
+                        // on waking, mid-write. Not a later pass here,
+                        // which may not run before the system stops
+                        // waiting once the display is off.
+                        self.backend.send(Command::AnswerSleep {
+                            ack,
+                            by: seen + SLEEP_ANSWER_WAIT,
+                        });
                     } else {
                         ack.done();
                     }
@@ -11283,9 +11289,6 @@ impl App {
                     ack.done();
                 }
                 Event::Resumed => {
-                    if let Some(ack) = self.suspend_ack.take() {
-                        ack.done();
-                    }
                     // fastframe-power's `Power::take_suspended_at`
                     // (crmne/fastframe#24) will give when the reader heard
                     // of the sleep, which holds even if this pass only got
@@ -11304,14 +11307,6 @@ impl App {
                     self.poll_remote_soon();
                 }
             }
-        }
-        // The reader gives up waiting after a moment, so a player that never
-        // answers cannot hold the system awake.
-        if self.suspend_ack.is_some()
-            && !matches!(self.local.playback, Playback::Playing | Playback::Loading)
-            && let Some(ack) = self.suspend_ack.take()
-        {
-            ack.done();
         }
     }
 
@@ -21305,6 +21300,7 @@ mod tests {
             });
             output.textures_delta.clear();
         };
+        let before = Instant::now();
         pass(&mut app);
         assert!(!app.now_playing().is_some_and(|now| now.playing));
         assert!(
@@ -21315,18 +21311,20 @@ mod tests {
         );
         assert_eq!(app.local.position_at, None, "the position stops counting");
         assert!(app.suspended_at.is_some());
-        // Read on the app's side until fastframe-power's `Ack::is_done`
-        // (crmne/fastframe#24) lets the test read the answer itself.
+        // Read from what the backend was handed until fastframe-power's
+        // `Ack::is_done` (crmne/fastframe#24) lets the test read the answer.
+        let answers = app.backend.take_sleep_answers();
+        let [by] = answers.as_slice() else {
+            panic!("the backend answers once the player has paused, got {answers:?}");
+        };
         assert!(
-            app.suspend_ack.is_some(),
-            "the system waits until the player has paused"
+            *by >= before + SLEEP_ANSWER_WAIT,
+            "not before the player has had its time to pause"
         );
-
-        let mut paused = app.local.clone();
-        paused.playback = Playback::Paused;
-        app.handle_local(paused);
-        pass(&mut app);
-        assert!(app.suspend_ack.is_none(), "the system is answered");
+        assert!(
+            *by <= Instant::now() + SLEEP_ANSWER_WAIT,
+            "within the time the system waits"
+        );
     }
 
     /// On waking, playback here picks up paused where it stopped, however
@@ -21370,9 +21368,12 @@ mod tests {
         });
         output.textures_delta.clear();
         assert!(app.suspended_at.is_some(), "the sleep was seen");
-        // Read on the app's side until fastframe-power's `Ack::is_done`
-        // (crmne/fastframe#24) lets the test read the answer itself.
-        assert!(app.suspend_ack.is_none(), "answered at once");
+        // Read from what the backend was handed until fastframe-power's
+        // `Ack::is_done` (crmne/fastframe#24) lets the test read the answer.
+        assert!(
+            app.backend.take_sleep_answers().is_empty(),
+            "answered at once, not handed to the backend"
+        );
     }
 
     /// A pause pressed a moment before the system sleeps shows at once,
@@ -21402,16 +21403,11 @@ mod tests {
             output.textures_delta.clear();
         };
         pass(&mut app);
-        assert!(
-            app.suspend_ack.is_some(),
-            "answered before the player had paused"
+        assert_eq!(
+            app.backend.take_sleep_answers().len(),
+            1,
+            "the backend waits for the player, not for what is shown"
         );
-
-        let mut paused = app.local.clone();
-        paused.playback = Playback::Paused;
-        app.handle_local(paused);
-        pass(&mut app);
-        assert!(app.suspend_ack.is_none(), "the system is answered");
     }
 
     /// Local playback inside an album, as a failing load leaves it: the
